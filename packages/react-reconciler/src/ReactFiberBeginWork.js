@@ -54,9 +54,15 @@ import invariant from 'shared/invariant';
 import shallowEqual from 'shared/shallowEqual';
 import getComponentName from 'shared/getComponentName';
 import ReactStrictModeWarnings from './ReactStrictModeWarnings';
+import {refineResolvedLazyComponent} from 'shared/ReactLazyComponent';
+import {REACT_LAZY_TYPE} from 'shared/ReactSymbols';
 import warning from 'shared/warning';
 import warningWithoutStack from 'shared/warningWithoutStack';
-import * as ReactCurrentFiber from './ReactCurrentFiber';
+import {
+  setCurrentPhase,
+  getCurrentFiberOwnerNameInDevOrNull,
+  getCurrentFiberStackInDev,
+} from './ReactCurrentFiber';
 import {startWorkTimer, cancelWorkTimer} from './ReactDebugFiberPerf';
 
 import {
@@ -126,12 +132,14 @@ let didWarnAboutBadClass;
 let didWarnAboutContextTypeOnFunctionComponent;
 let didWarnAboutGetDerivedStateOnFunctionComponent;
 let didWarnAboutFunctionRefs;
+export let didWarnAboutReassigningProps;
 
 if (__DEV__) {
   didWarnAboutBadClass = {};
   didWarnAboutContextTypeOnFunctionComponent = {};
   didWarnAboutGetDerivedStateOnFunctionComponent = {};
   didWarnAboutFunctionRefs = {};
+  didWarnAboutReassigningProps = false;
 }
 
 export function reconcileChildren(
@@ -206,6 +214,23 @@ function updateForwardRef(
   nextProps: any,
   renderExpirationTime: ExpirationTime,
 ) {
+  if (__DEV__) {
+    if (workInProgress.type !== workInProgress.elementType) {
+      // Lazy component props can't be validated in createElement
+      // because they're only guaranteed to be resolved here.
+      const innerPropTypes = Component.propTypes;
+      if (innerPropTypes) {
+        checkPropTypes(
+          innerPropTypes,
+          nextProps, // Resolved props
+          'prop',
+          getComponentName(Component),
+          getCurrentFiberStackInDev,
+        );
+      }
+    }
+  }
+
   const render = Component.render;
   const ref = workInProgress.ref;
 
@@ -215,9 +240,9 @@ function updateForwardRef(
   prepareToUseHooks(current, workInProgress, renderExpirationTime);
   if (__DEV__) {
     ReactCurrentOwner.current = workInProgress;
-    ReactCurrentFiber.setCurrentPhase('render');
+    setCurrentPhase('render');
     nextChildren = render(nextProps, ref);
-    ReactCurrentFiber.setCurrentPhase(null);
+    setCurrentPhase(null);
   } else {
     nextChildren = render(nextProps, ref);
   }
@@ -244,12 +269,20 @@ function updateMemoComponent(
 ): null | Fiber {
   if (current === null) {
     let type = Component.type;
-    if (isSimpleFunctionComponent(type) && Component.compare === null) {
+    if (
+      isSimpleFunctionComponent(type) &&
+      Component.compare === null &&
+      // SimpleMemoComponent codepath doesn't resolve outer props either.
+      Component.defaultProps === undefined
+    ) {
       // If this is a plain function component without default props,
       // and with only the default shallow comparison, we upgrade it
       // to a SimpleMemoComponent to allow fast path updates.
       workInProgress.tag = SimpleMemoComponent;
       workInProgress.type = type;
+      if (__DEV__) {
+        validateFunctionComponentInDev(workInProgress, type);
+      }
       return updateSimpleMemoComponent(
         current,
         workInProgress,
@@ -258,6 +291,20 @@ function updateMemoComponent(
         updateExpirationTime,
         renderExpirationTime,
       );
+    }
+    if (__DEV__) {
+      const innerPropTypes = type.propTypes;
+      if (innerPropTypes) {
+        // Inner memo component props aren't currently validated in createElement.
+        // We could move it there, but we'd still need this for lazy code path.
+        checkPropTypes(
+          innerPropTypes,
+          nextProps, // Resolved props
+          'prop',
+          getComponentName(type),
+          getCurrentFiberStackInDev,
+        );
+      }
     }
     let child = createFiberFromTypeAndProps(
       Component.type,
@@ -271,6 +318,21 @@ function updateMemoComponent(
     child.return = workInProgress;
     workInProgress.child = child;
     return child;
+  }
+  if (__DEV__) {
+    const type = Component.type;
+    const innerPropTypes = type.propTypes;
+    if (innerPropTypes) {
+      // Inner memo component props aren't currently validated in createElement.
+      // We could move it there, but we'd still need this for lazy code path.
+      checkPropTypes(
+        innerPropTypes,
+        nextProps, // Resolved props
+        'prop',
+        getComponentName(type),
+        getCurrentFiberStackInDev,
+      );
+    }
   }
   let currentChild = ((current.child: any): Fiber); // This is always exactly one child
   if (updateExpirationTime < renderExpirationTime) {
@@ -309,6 +371,30 @@ function updateSimpleMemoComponent(
   updateExpirationTime,
   renderExpirationTime: ExpirationTime,
 ): null | Fiber {
+  if (__DEV__) {
+    if (workInProgress.type !== workInProgress.elementType) {
+      // Lazy component props can't be validated in createElement
+      // because they're only guaranteed to be resolved here.
+      let outerMemoType = workInProgress.elementType;
+      if (outerMemoType.$$typeof === REACT_LAZY_TYPE) {
+        // We warn when you define propTypes on lazy()
+        // so let's just skip over it to find memo() outer wrapper.
+        // Inner props for memo are validated later.
+        outerMemoType = refineResolvedLazyComponent(outerMemoType);
+      }
+      const outerPropTypes = outerMemoType && (outerMemoType: any).propTypes;
+      if (outerPropTypes) {
+        checkPropTypes(
+          outerPropTypes,
+          nextProps, // Resolved (SimpleMemoComponent has no defaultProps)
+          'prop',
+          getComponentName(outerMemoType),
+          getCurrentFiberStackInDev,
+        );
+      }
+      // Inner propTypes will be validated in the function component path.
+    }
+  }
   if (current !== null && updateExpirationTime < renderExpirationTime) {
     const prevProps = current.memoizedProps;
     if (
@@ -398,6 +484,23 @@ function updateFunctionComponent(
   nextProps: any,
   renderExpirationTime,
 ) {
+  if (__DEV__) {
+    if (workInProgress.type !== workInProgress.elementType) {
+      // Lazy component props can't be validated in createElement
+      // because they're only guaranteed to be resolved here.
+      const innerPropTypes = Component.propTypes;
+      if (innerPropTypes) {
+        checkPropTypes(
+          innerPropTypes,
+          nextProps, // Resolved props
+          'prop',
+          getComponentName(Component),
+          getCurrentFiberStackInDev,
+        );
+      }
+    }
+  }
+
   const unmaskedContext = getUnmaskedContext(workInProgress, Component, true);
   const context = getMaskedContext(workInProgress, unmaskedContext);
 
@@ -406,9 +509,9 @@ function updateFunctionComponent(
   prepareToUseHooks(current, workInProgress, renderExpirationTime);
   if (__DEV__) {
     ReactCurrentOwner.current = workInProgress;
-    ReactCurrentFiber.setCurrentPhase('render');
+    setCurrentPhase('render');
     nextChildren = Component(nextProps, context);
-    ReactCurrentFiber.setCurrentPhase(null);
+    setCurrentPhase(null);
   } else {
     nextChildren = Component(nextProps, context);
   }
@@ -432,6 +535,23 @@ function updateClassComponent(
   nextProps,
   renderExpirationTime: ExpirationTime,
 ) {
+  if (__DEV__) {
+    if (workInProgress.type !== workInProgress.elementType) {
+      // Lazy component props can't be validated in createElement
+      // because they're only guaranteed to be resolved here.
+      const innerPropTypes = Component.propTypes;
+      if (innerPropTypes) {
+        checkPropTypes(
+          innerPropTypes,
+          nextProps, // Resolved props
+          'prop',
+          getComponentName(Component),
+          getCurrentFiberStackInDev,
+        );
+      }
+    }
+  }
+
   // Push context providers early to prevent context stack mismatches.
   // During mounting we don't know the child context yet as the instance doesn't exist.
   // We will invalidate the child context in finishClassComponent() right after rendering.
@@ -488,7 +608,7 @@ function updateClassComponent(
       renderExpirationTime,
     );
   }
-  return finishClassComponent(
+  const nextUnitOfWork = finishClassComponent(
     current,
     workInProgress,
     Component,
@@ -496,6 +616,19 @@ function updateClassComponent(
     hasContext,
     renderExpirationTime,
   );
+  if (__DEV__) {
+    let inst = workInProgress.stateNode;
+    if (inst.props !== nextProps) {
+      warning(
+        didWarnAboutReassigningProps,
+        'It looks like %s is reassigning its own `this.props` while rendering. ' +
+          'This is not supported and can lead to confusing bugs.',
+        getComponentName(workInProgress.type) || 'a component',
+      );
+      didWarnAboutReassigningProps = true;
+    }
+  }
+  return nextUnitOfWork;
 }
 
 function finishClassComponent(
@@ -545,7 +678,7 @@ function finishClassComponent(
     }
   } else {
     if (__DEV__) {
-      ReactCurrentFiber.setCurrentPhase('render');
+      setCurrentPhase('render');
       nextChildren = instance.render();
       if (
         debugRenderPhaseSideEffects ||
@@ -554,7 +687,7 @@ function finishClassComponent(
       ) {
         instance.render();
       }
-      ReactCurrentFiber.setCurrentPhase(null);
+      setCurrentPhase(null);
     } else {
       nextChildren = instance.render();
     }
@@ -800,6 +933,20 @@ function mountLazyComponent(
       break;
     }
     case MemoComponent: {
+      if (__DEV__) {
+        if (workInProgress.type !== workInProgress.elementType) {
+          const outerPropTypes = Component.propTypes;
+          if (outerPropTypes) {
+            checkPropTypes(
+              outerPropTypes,
+              resolvedProps, // Resolved for outer only
+              'prop',
+              getComponentName(Component),
+              getCurrentFiberStackInDev,
+            );
+          }
+        }
+      }
       child = updateMemoComponent(
         null,
         workInProgress,
@@ -811,14 +958,25 @@ function mountLazyComponent(
       break;
     }
     default: {
-      // This message intentionally doesn't metion ForwardRef or MemoComponent
+      let hint = '';
+      if (__DEV__) {
+        if (
+          Component !== null &&
+          typeof Component === 'object' &&
+          Component.$$typeof === REACT_LAZY_TYPE
+        ) {
+          hint = ' Did you wrap a component in React.lazy() more than once?';
+        }
+      }
+      // This message intentionally doesn't mention ForwardRef or MemoComponent
       // because the fact that it's a separate type of work is an
       // implementation detail.
       invariant(
         false,
         'Element type is invalid. Received a promise that resolves to: %s. ' +
-          'Promise elements must resolve to a class or function.',
+          'Lazy element type must resolve to a class or function.%s',
         Component,
+        hint,
       );
     }
   }
@@ -990,68 +1148,72 @@ function mountIndeterminateComponent(
     // Proceed under the assumption that this is a function component
     workInProgress.tag = FunctionComponent;
     value = finishHooks(Component, props, value, context);
-    if (__DEV__) {
-      if (Component) {
-        warningWithoutStack(
-          !Component.childContextTypes,
-          '%s(...): childContextTypes cannot be defined on a function component.',
-          Component.displayName || Component.name || 'Component',
-        );
-      }
-      if (workInProgress.ref !== null) {
-        let info = '';
-        const ownerName = ReactCurrentFiber.getCurrentFiberOwnerNameInDevOrNull();
-        if (ownerName) {
-          info += '\n\nCheck the render method of `' + ownerName + '`.';
-        }
-
-        let warningKey = ownerName || workInProgress._debugID || '';
-        const debugSource = workInProgress._debugSource;
-        if (debugSource) {
-          warningKey = debugSource.fileName + ':' + debugSource.lineNumber;
-        }
-        if (!didWarnAboutFunctionRefs[warningKey]) {
-          didWarnAboutFunctionRefs[warningKey] = true;
-          warning(
-            false,
-            'Function components cannot be given refs. ' +
-              'Attempts to access this ref will fail.%s',
-            info,
-          );
-        }
-      }
-
-      if (typeof Component.getDerivedStateFromProps === 'function') {
-        const componentName = getComponentName(Component) || 'Unknown';
-
-        if (!didWarnAboutGetDerivedStateOnFunctionComponent[componentName]) {
-          warningWithoutStack(
-            false,
-            '%s: Function components do not support getDerivedStateFromProps.',
-            componentName,
-          );
-          didWarnAboutGetDerivedStateOnFunctionComponent[componentName] = true;
-        }
-      }
-
-      if (
-        typeof Component.contextType === 'object' &&
-        Component.contextType !== null
-      ) {
-        const componentName = getComponentName(Component) || 'Unknown';
-
-        if (!didWarnAboutContextTypeOnFunctionComponent[componentName]) {
-          warningWithoutStack(
-            false,
-            '%s: Function components do not support contextType.',
-            componentName,
-          );
-          didWarnAboutContextTypeOnFunctionComponent[componentName] = true;
-        }
-      }
-    }
     reconcileChildren(null, workInProgress, value, renderExpirationTime);
+    if (__DEV__) {
+      validateFunctionComponentInDev(workInProgress, Component);
+    }
     return workInProgress.child;
+  }
+}
+
+function validateFunctionComponentInDev(workInProgress: Fiber, Component: any) {
+  if (Component) {
+    warningWithoutStack(
+      !Component.childContextTypes,
+      '%s(...): childContextTypes cannot be defined on a function component.',
+      Component.displayName || Component.name || 'Component',
+    );
+  }
+  if (workInProgress.ref !== null) {
+    let info = '';
+    const ownerName = getCurrentFiberOwnerNameInDevOrNull();
+    if (ownerName) {
+      info += '\n\nCheck the render method of `' + ownerName + '`.';
+    }
+
+    let warningKey = ownerName || workInProgress._debugID || '';
+    const debugSource = workInProgress._debugSource;
+    if (debugSource) {
+      warningKey = debugSource.fileName + ':' + debugSource.lineNumber;
+    }
+    if (!didWarnAboutFunctionRefs[warningKey]) {
+      didWarnAboutFunctionRefs[warningKey] = true;
+      warning(
+        false,
+        'Function components cannot be given refs. ' +
+          'Attempts to access this ref will fail.%s',
+        info,
+      );
+    }
+  }
+
+  if (typeof Component.getDerivedStateFromProps === 'function') {
+    const componentName = getComponentName(Component) || 'Unknown';
+
+    if (!didWarnAboutGetDerivedStateOnFunctionComponent[componentName]) {
+      warningWithoutStack(
+        false,
+        '%s: Function components do not support getDerivedStateFromProps.',
+        componentName,
+      );
+      didWarnAboutGetDerivedStateOnFunctionComponent[componentName] = true;
+    }
+  }
+
+  if (
+    typeof Component.contextType === 'object' &&
+    Component.contextType !== null
+  ) {
+    const componentName = getComponentName(Component) || 'Unknown';
+
+    if (!didWarnAboutContextTypeOnFunctionComponent[componentName]) {
+      warningWithoutStack(
+        false,
+        '%s: Function components do not support contextType.',
+        componentName,
+      );
+      didWarnAboutContextTypeOnFunctionComponent[componentName] = true;
+    }
   }
 }
 
@@ -1178,7 +1340,6 @@ function updateSuspenseComponent(
           currentPrimaryChildFragment.pendingProps,
           NoWork,
         );
-        primaryChildFragment.effectTag |= Placement;
 
         if ((workInProgress.mode & ConcurrentMode) === NoContext) {
           // Outside of concurrent mode, we commit the effects from the
@@ -1213,7 +1374,6 @@ function updateSuspenseComponent(
           nextFallbackChildren,
           currentFallbackChildFragment.expirationTime,
         ));
-        fallbackChildFragment.effectTag |= Placement;
         child = primaryChildFragment;
         primaryChildFragment.childExpirationTime = NoWork;
         // Skip the primary children, and continue working on the
@@ -1244,7 +1404,7 @@ function updateSuspenseComponent(
     } else {
       // The current tree has not already timed out. That means the primary
       // children are not wrapped in a fragment fiber.
-      const currentPrimaryChild: Fiber = (current.child: any);
+      const currentPrimaryChild = current.child;
       if (nextDidTimeout) {
         // Timed out. Wrap the children in a fragment fiber to keep them
         // separate from the fallback children.
@@ -1257,10 +1417,12 @@ function updateSuspenseComponent(
           NoWork,
           null,
         );
-
-        primaryChildFragment.effectTag |= Placement;
         primaryChildFragment.child = currentPrimaryChild;
-        currentPrimaryChild.return = primaryChildFragment;
+
+        // Even though we're creating a new fiber, there are no new children,
+        // because we're reusing an already mounted tree. So we don't need to
+        // schedule a placement.
+        // primaryChildFragment.effectTag |= Placement;
 
         if ((workInProgress.mode & ConcurrentMode) === NoContext) {
           // Outside of concurrent mode, we commit the effects from the
@@ -1312,6 +1474,7 @@ function updateSuspenseComponent(
         );
       }
     }
+    workInProgress.stateNode = current.stateNode;
   }
 
   workInProgress.memoizedState = nextState;
@@ -1371,7 +1534,7 @@ function updateContextProvider(
         newProps,
         'prop',
         'Context.Provider',
-        ReactCurrentFiber.getCurrentFiberStackInDev,
+        getCurrentFiberStackInDev,
       );
     }
   }
@@ -1462,9 +1625,9 @@ function updateContextConsumer(
   let newChildren;
   if (__DEV__) {
     ReactCurrentOwner.current = workInProgress;
-    ReactCurrentFiber.setCurrentPhase('render');
+    setCurrentPhase('render');
     newChildren = render(newValue);
-    ReactCurrentFiber.setCurrentPhase(null);
+    setCurrentPhase(null);
   } else {
     newChildren = render(newValue);
   }
@@ -1713,7 +1876,23 @@ function beginWork(
     case MemoComponent: {
       const type = workInProgress.type;
       const unresolvedProps = workInProgress.pendingProps;
-      const resolvedProps = resolveDefaultProps(type.type, unresolvedProps);
+      // Resolve outer props first, then resolve inner props.
+      let resolvedProps = resolveDefaultProps(type, unresolvedProps);
+      if (__DEV__) {
+        if (workInProgress.type !== workInProgress.elementType) {
+          const outerPropTypes = type.propTypes;
+          if (outerPropTypes) {
+            checkPropTypes(
+              outerPropTypes,
+              resolvedProps, // Resolved for outer only
+              'prop',
+              getComponentName(type),
+              getCurrentFiberStackInDev,
+            );
+          }
+        }
+      }
+      resolvedProps = resolveDefaultProps(type.type, resolvedProps);
       return updateMemoComponent(
         current,
         workInProgress,

@@ -7,6 +7,7 @@
  * @flow
  */
 
+import type {ThreadID} from './ReactThreadIDAllocator';
 import type {ReactElement} from 'shared/ReactElementType';
 import type {ReactProvider, ReactContext} from 'shared/ReactTypes';
 
@@ -16,7 +17,6 @@ import getComponentName from 'shared/getComponentName';
 import lowPriorityWarning from 'shared/lowPriorityWarning';
 import warning from 'shared/warning';
 import warningWithoutStack from 'shared/warningWithoutStack';
-import checkPropTypes from 'prop-types/checkPropTypes';
 import describeComponentFrame from 'shared/describeComponentFrame';
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import {
@@ -40,6 +40,12 @@ import {
 } from 'shared/ReactSymbols';
 
 import {
+  emptyObject,
+  processContext,
+  validateContextBounds,
+} from './ReactPartialRendererContext';
+import {allocThreadID, freeThreadID} from './ReactThreadIDAllocator';
+import {
   createMarkupForCustomAttribute,
   createMarkupForProperty,
   createMarkupForRoot,
@@ -50,6 +56,8 @@ import {
   finishHooks,
   Dispatcher,
   DispatcherWithoutHooks,
+  currentThreadID,
+  setCurrentThreadID,
 } from './ReactPartialRendererHooks';
 import {
   Namespaces,
@@ -176,7 +184,6 @@ const didWarnAboutBadClass = {};
 const didWarnAboutDeprecatedWillMount = {};
 const didWarnAboutUndefinedDerivedState = {};
 const didWarnAboutUninitializedState = {};
-const didWarnAboutInvalidateContextType = {};
 const valuePropNames = ['value', 'defaultValue'];
 const newlineEatingTags = {
   listing: true,
@@ -324,65 +331,6 @@ function flattenOptionChildren(children: mixed): ?string {
   return content;
 }
 
-const emptyObject = {};
-if (__DEV__) {
-  Object.freeze(emptyObject);
-}
-
-function maskContext(type, context) {
-  const contextTypes = type.contextTypes;
-  if (!contextTypes) {
-    return emptyObject;
-  }
-  const maskedContext = {};
-  for (const contextName in contextTypes) {
-    maskedContext[contextName] = context[contextName];
-  }
-  return maskedContext;
-}
-
-function checkContextTypes(typeSpecs, values, location: string) {
-  if (__DEV__) {
-    checkPropTypes(
-      typeSpecs,
-      values,
-      location,
-      'Component',
-      getCurrentServerStackImpl,
-    );
-  }
-}
-
-function processContext(type, context) {
-  const contextType = type.contextType;
-  if (typeof contextType === 'object' && contextType !== null) {
-    if (__DEV__) {
-      if (contextType.$$typeof !== REACT_CONTEXT_TYPE) {
-        let name = getComponentName(type) || 'Component';
-        if (!didWarnAboutInvalidateContextType[name]) {
-          didWarnAboutInvalidateContextType[type] = true;
-          warningWithoutStack(
-            false,
-            '%s defines an invalid contextType. ' +
-              'contextType should point to the Context object returned by React.createContext(). ' +
-              'Did you accidentally pass the Context.Provider instead?',
-            name,
-          );
-        }
-      }
-    }
-    return contextType._currentValue;
-  } else {
-    const maskedContext = maskContext(type, context);
-    if (__DEV__) {
-      if (type.contextTypes) {
-        checkContextTypes(type.contextTypes, maskedContext, 'context');
-      }
-    }
-    return maskedContext;
-  }
-}
-
 const hasOwnProperty = Object.prototype.hasOwnProperty;
 const STYLE = 'style';
 const RESERVED_PROPS = {
@@ -453,6 +401,7 @@ function validateRenderResult(child, type) {
 function resolve(
   child: mixed,
   context: Object,
+  threadID: ThreadID,
 ): {|
   child: mixed,
   context: Object,
@@ -472,7 +421,7 @@ function resolve(
 
   // Extra closure so queue and replace can be captured properly
   function processChild(element, Component) {
-    let publicContext = processContext(Component, context);
+    let publicContext = processContext(Component, context, threadID);
 
     let queue = [];
     let replace = false;
@@ -707,6 +656,7 @@ type Frame = {
   type: mixed,
   domNamespace: string,
   children: FlatReactChildren,
+  fallbackFrame?: Frame,
   childIndex: number,
   context: Object,
   footer: string,
@@ -717,12 +667,14 @@ type FrameDev = Frame & {
 };
 
 class ReactDOMServerRenderer {
+  threadID: ThreadID;
   stack: Array<Frame>;
   exhausted: boolean;
   // TODO: type this more strictly:
   currentSelectValue: any;
   previousWasTextNode: boolean;
   makeStaticMarkup: boolean;
+  suspenseDepth: number;
 
   contextIndex: number;
   contextStack: Array<ReactContext<any>>;
@@ -745,11 +697,13 @@ class ReactDOMServerRenderer {
     if (__DEV__) {
       ((topFrame: any): FrameDev).debugElementStack = [];
     }
+    this.threadID = allocThreadID();
     this.stack = [topFrame];
     this.exhausted = false;
     this.currentSelectValue = null;
     this.previousWasTextNode = false;
     this.makeStaticMarkup = makeStaticMarkup;
+    this.suspenseDepth = 0;
 
     // Context (new API)
     this.contextIndex = -1;
@@ -757,6 +711,13 @@ class ReactDOMServerRenderer {
     this.contextValueStack = [];
     if (__DEV__) {
       this.contextProviderStack = [];
+    }
+  }
+
+  destroy() {
+    if (!this.exhausted) {
+      this.exhausted = true;
+      freeThreadID(this.threadID);
     }
   }
 
@@ -773,7 +734,9 @@ class ReactDOMServerRenderer {
   pushProvider<T>(provider: ReactProvider<T>): void {
     const index = ++this.contextIndex;
     const context: ReactContext<any> = provider.type._context;
-    const previousValue = context._currentValue;
+    const threadID = this.threadID;
+    validateContextBounds(context, threadID);
+    const previousValue = context[threadID];
 
     // Remember which value to restore this context to on our way up.
     this.contextStack[index] = context;
@@ -784,7 +747,7 @@ class ReactDOMServerRenderer {
     }
 
     // Mutate the current value.
-    context._currentValue = provider.props.value;
+    context[threadID] = provider.props.value;
   }
 
   popProvider<T>(provider: ReactProvider<T>): void {
@@ -810,7 +773,9 @@ class ReactDOMServerRenderer {
     this.contextIndex--;
 
     // Restore to the previous value we stored as we were walking down.
-    context._currentValue = previousValue;
+    // We've already verified that this context has been expanded to accommodate
+    // this thread id, so we don't need to do it again.
+    context[this.threadID] = previousValue;
   }
 
   read(bytes: number): string | null {
@@ -818,6 +783,8 @@ class ReactDOMServerRenderer {
       return null;
     }
 
+    const prevThreadID = currentThreadID;
+    setCurrentThreadID(this.threadID);
     const prevDispatcher = ReactCurrentOwner.currentDispatcher;
     if (enableHooks) {
       ReactCurrentOwner.currentDispatcher = Dispatcher;
@@ -825,16 +792,19 @@ class ReactDOMServerRenderer {
       ReactCurrentOwner.currentDispatcher = DispatcherWithoutHooks;
     }
     try {
-      let out = '';
-      while (out.length < bytes) {
+      // Markup generated within <Suspense> ends up buffered until we know
+      // nothing in that boundary suspended
+      let out = [''];
+      let suspended = false;
+      while (out[0].length < bytes) {
         if (this.stack.length === 0) {
           this.exhausted = true;
+          freeThreadID(this.threadID);
           break;
         }
         const frame: Frame = this.stack[this.stack.length - 1];
-        if (frame.childIndex >= frame.children.length) {
+        if (suspended || frame.childIndex >= frame.children.length) {
           const footer = frame.footer;
-          out += footer;
           if (footer !== '') {
             this.previousWasTextNode = false;
           }
@@ -848,28 +818,60 @@ class ReactDOMServerRenderer {
           ) {
             const provider: ReactProvider<any> = (frame.type: any);
             this.popProvider(provider);
+          } else if (frame.type === REACT_SUSPENSE_TYPE) {
+            this.suspenseDepth--;
+            const buffered = out.pop();
+
+            if (suspended) {
+              suspended = false;
+              // If rendering was suspended at this boundary, render the fallbackFrame
+              const fallbackFrame = frame.fallbackFrame;
+              invariant(
+                fallbackFrame,
+                'suspense fallback not found, something is broken',
+              );
+              this.stack.push(fallbackFrame);
+              // Skip flushing output since we're switching to the fallback
+              continue;
+            } else {
+              out[this.suspenseDepth] += buffered;
+            }
           }
+
+          // Flush output
+          out[this.suspenseDepth] += footer;
           continue;
         }
         const child = frame.children[frame.childIndex++];
+
+        let outBuffer = '';
         if (__DEV__) {
           pushCurrentDebugStack(this.stack);
           // We're starting work on this frame, so reset its inner stack.
           ((frame: any): FrameDev).debugElementStack.length = 0;
-          try {
-            // Be careful! Make sure this matches the PROD path below.
-            out += this.render(child, frame.context, frame.domNamespace);
-          } finally {
+        }
+        try {
+          outBuffer += this.render(child, frame.context, frame.domNamespace);
+        } catch (err) {
+          if (enableSuspenseServerRenderer && typeof err.then === 'function') {
+            suspended = true;
+          } else {
+            throw err;
+          }
+        } finally {
+          if (__DEV__) {
             popCurrentDebugStack();
           }
-        } else {
-          // Be careful! Make sure this matches the DEV path above.
-          out += this.render(child, frame.context, frame.domNamespace);
         }
+        if (out.length <= this.suspenseDepth) {
+          out.push('');
+        }
+        out[this.suspenseDepth] += outBuffer;
       }
-      return out;
+      return out[0];
     } finally {
       ReactCurrentOwner.currentDispatcher = prevDispatcher;
+      setCurrentThreadID(prevThreadID);
     }
   }
 
@@ -893,7 +895,7 @@ class ReactDOMServerRenderer {
       return escapeTextForBrowser(text);
     } else {
       let nextChild;
-      ({child: nextChild, context} = resolve(child, context));
+      ({child: nextChild, context} = resolve(child, context, this.threadID));
       if (nextChild === null || nextChild === false) {
         return '';
       } else if (!React.isValidElement(nextChild)) {
@@ -960,12 +962,24 @@ class ReactDOMServerRenderer {
         }
         case REACT_SUSPENSE_TYPE: {
           if (enableSuspenseServerRenderer) {
-            const nextChildren = toArray(
-              // Always use the fallback when synchronously rendering to string.
+            const fallbackChildren = toArray(
               ((nextChild: any): ReactElement).props.fallback,
             );
-            const frame: Frame = {
+            const nextChildren = toArray(
+              ((nextChild: any): ReactElement).props.children,
+            );
+            const fallbackFrame: Frame = {
               type: null,
+              domNamespace: parentNamespace,
+              children: fallbackChildren,
+              childIndex: 0,
+              context: context,
+              footer: '',
+              out: '',
+            };
+            const frame: Frame = {
+              fallbackFrame,
+              type: REACT_SUSPENSE_TYPE,
               domNamespace: parentNamespace,
               children: nextChildren,
               childIndex: 0,
@@ -974,8 +988,10 @@ class ReactDOMServerRenderer {
             };
             if (__DEV__) {
               ((frame: any): FrameDev).debugElementStack = [];
+              ((fallbackFrame: any): FrameDev).debugElementStack = [];
             }
             this.stack.push(frame);
+            this.suspenseDepth++;
             return '';
           } else {
             invariant(false, 'ReactDOMServer does not yet support Suspense.');
@@ -1086,7 +1102,9 @@ class ReactDOMServerRenderer {
               }
             }
             const nextProps: any = (nextChild: any).props;
-            const nextValue = reactContext._currentValue;
+            const threadID = this.threadID;
+            validateContextBounds(reactContext, threadID);
+            const nextValue = reactContext[threadID];
 
             const nextChildren = toArray(nextProps.children(nextValue));
             const frame: Frame = {

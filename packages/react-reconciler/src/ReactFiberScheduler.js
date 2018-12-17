@@ -68,7 +68,12 @@ import invariant from 'shared/invariant';
 import warningWithoutStack from 'shared/warningWithoutStack';
 
 import ReactFiberInstrumentation from './ReactFiberInstrumentation';
-import * as ReactCurrentFiber from './ReactCurrentFiber';
+import {
+  getStackByFiberInDevAndProd,
+  phase as ReactCurrentFiberPhase,
+  resetCurrentFiber,
+  setCurrentFiber,
+} from './ReactCurrentFiber';
 import {
   now,
   scheduleDeferredCallback,
@@ -120,13 +125,8 @@ import {
   computeAsyncExpiration,
   computeInteractiveExpiration,
 } from './ReactFiberExpirationTime';
-import {ConcurrentMode, ProfileMode, NoContext} from './ReactTypeOfMode';
-import {
-  enqueueUpdate,
-  resetCurrentlyProcessingQueue,
-  ForceUpdate,
-  createUpdate,
-} from './ReactUpdateQueue';
+import {ConcurrentMode, ProfileMode} from './ReactTypeOfMode';
+import {enqueueUpdate, resetCurrentlyProcessingQueue} from './ReactUpdateQueue';
 import {createCapturedValue} from './ReactCapturedValue';
 import {
   isContextProvider as isLegacyContextProvider,
@@ -180,11 +180,11 @@ let warnAboutInvalidUpdates;
 
 if (enableSchedulerTracing) {
   // Provide explicit error message when production+profiling bundle of e.g. react-dom
-  // is used with production (non-profiling) bundle of schedule/tracing
+  // is used with production (non-profiling) bundle of scheduler/tracing
   invariant(
     __interactionsRef != null && __interactionsRef.current != null,
     'It is not supported to run the profiling version of a renderer (for example, `react-dom/profiling`) ' +
-      'without also replacing the `schedule/tracing` module with `schedule/tracing-profiling`. ' +
+      'without also replacing the `scheduler/tracing` module with `scheduler/tracing-profiling`. ' +
       'Your bundler might have a setting for aliasing both modules. ' +
       'Learn more at http://fb.me/react-profiling',
   );
@@ -210,13 +210,13 @@ if (__DEV__) {
       isClass
         ? 'the componentWillUnmount method'
         : 'a useEffect cleanup function',
-      ReactCurrentFiber.getStackByFiberInDevAndProd(fiber),
+      getStackByFiberInDevAndProd(fiber),
     );
     didWarnStateUpdateForUnmountedComponent[componentName] = true;
   };
 
   warnAboutInvalidUpdates = function(instance: React$Component<any>) {
-    switch (ReactCurrentFiber.phase) {
+    switch (ReactCurrentFiberPhase) {
       case 'getChildContext':
         if (didWarnSetStateChildContext) {
           return;
@@ -392,7 +392,7 @@ function resetStack() {
 function commitAllHostEffects() {
   while (nextEffect !== null) {
     if (__DEV__) {
-      ReactCurrentFiber.setCurrentFiber(nextEffect);
+      setCurrentFiber(nextEffect);
     }
     recordEffect();
 
@@ -451,14 +451,14 @@ function commitAllHostEffects() {
   }
 
   if (__DEV__) {
-    ReactCurrentFiber.resetCurrentFiber();
+    resetCurrentFiber();
   }
 }
 
 function commitBeforeMutationLifecycles() {
   while (nextEffect !== null) {
     if (__DEV__) {
-      ReactCurrentFiber.setCurrentFiber(nextEffect);
+      setCurrentFiber(nextEffect);
     }
 
     const effectTag = nextEffect.effectTag;
@@ -472,7 +472,7 @@ function commitBeforeMutationLifecycles() {
   }
 
   if (__DEV__) {
-    ReactCurrentFiber.resetCurrentFiber();
+    resetCurrentFiber();
   }
 }
 
@@ -947,7 +947,7 @@ function completeUnitOfWork(workInProgress: Fiber): Fiber | null {
     // progress.
     const current = workInProgress.alternate;
     if (__DEV__) {
-      ReactCurrentFiber.setCurrentFiber(workInProgress);
+      setCurrentFiber(workInProgress);
     }
 
     const returnFiber = workInProgress.return;
@@ -988,7 +988,7 @@ function completeUnitOfWork(workInProgress: Fiber): Fiber | null {
       stopWorkTimer(workInProgress);
       resetChildExpirationTime(workInProgress, nextRenderExpirationTime);
       if (__DEV__) {
-        ReactCurrentFiber.resetCurrentFiber();
+        resetCurrentFiber();
       }
 
       if (nextUnitOfWork !== null) {
@@ -1076,7 +1076,7 @@ function completeUnitOfWork(workInProgress: Fiber): Fiber | null {
       }
 
       if (__DEV__) {
-        ReactCurrentFiber.resetCurrentFiber();
+        resetCurrentFiber();
       }
 
       if (next !== null) {
@@ -1132,7 +1132,7 @@ function performUnitOfWork(workInProgress: Fiber): Fiber | null {
   // See if beginning this work spawns more work.
   startWorkTimer(workInProgress);
   if (__DEV__) {
-    ReactCurrentFiber.setCurrentFiber(workInProgress);
+    setCurrentFiber(workInProgress);
   }
 
   if (__DEV__ && replayFailedUnitOfWorkWithInvokeGuardedCallback) {
@@ -1161,7 +1161,7 @@ function performUnitOfWork(workInProgress: Fiber): Fiber | null {
   }
 
   if (__DEV__) {
-    ReactCurrentFiber.resetCurrentFiber();
+    resetCurrentFiber();
     if (isReplayingFailedUnitOfWork) {
       // Currently replaying a failed unit of work. This should be unreachable,
       // because the render phase is meant to be idempotent, and it should
@@ -1641,61 +1641,61 @@ function renderDidError() {
   nextRenderDidError = true;
 }
 
-function retrySuspendedRoot(
+function pingSuspendedRoot(
   root: FiberRoot,
-  boundaryFiber: Fiber,
-  sourceFiber: Fiber,
-  suspendedTime: ExpirationTime,
+  thenable: Thenable,
+  pingTime: ExpirationTime,
 ) {
-  let retryTime;
+  // A promise that previously suspended React from committing has resolved.
+  // If React is still suspended, try again at the previous level (pingTime).
 
-  if (isPriorityLevelSuspended(root, suspendedTime)) {
-    // Ping at the original level
-    retryTime = suspendedTime;
+  const pingCache = root.pingCache;
+  if (pingCache !== null) {
+    // The thenable resolved, so we no longer need to memoize, because it will
+    // never be thrown again.
+    pingCache.delete(thenable);
+  }
 
-    markPingedPriorityLevel(root, retryTime);
+  if (nextRoot !== null && nextRenderExpirationTime === pingTime) {
+    // Received a ping at the same priority level at which we're currently
+    // rendering. Restart from the root.
+    nextRoot = null;
   } else {
-    // Suspense already timed out. Compute a new expiration time
-    const currentTime = requestCurrentTime();
-    retryTime = computeExpirationForFiber(currentTime, boundaryFiber);
+    // Confirm that the root is still suspended at this level. Otherwise exit.
+    if (isPriorityLevelSuspended(root, pingTime)) {
+      // Ping at the original level
+      markPingedPriorityLevel(root, pingTime);
+      const rootExpirationTime = root.expirationTime;
+      if (rootExpirationTime !== NoWork) {
+        requestWork(root, rootExpirationTime);
+      }
+    }
+  }
+}
+
+function retryTimedOutBoundary(boundaryFiber: Fiber, thenable: Thenable) {
+  // The boundary fiber (a Suspense component) previously timed out and was
+  // rendered in its fallback state. One of the promises that suspended it has
+  // resolved, which means at least part of the tree was likely unblocked. Try
+  // rendering again, at a new expiration time.
+
+  const retryCache: WeakSet<Thenable> | Set<Thenable> | null =
+    boundaryFiber.stateNode;
+  if (retryCache !== null) {
+    // The thenable resolved, so we no longer need to memoize, because it will
+    // never be thrown again.
+    retryCache.delete(thenable);
+  }
+
+  const currentTime = requestCurrentTime();
+  const retryTime = computeExpirationForFiber(currentTime, boundaryFiber);
+  const root = scheduleWorkToRoot(boundaryFiber, retryTime);
+  if (root !== null) {
     markPendingPriorityLevel(root, retryTime);
-  }
-
-  // TODO: If the suspense fiber has already rendered the primary children
-  // without suspending (that is, all of the promises have already resolved),
-  // we should not trigger another update here. One case this happens is when
-  // we are in sync mode and a single promise is thrown both on initial render
-  // and on update; we attach two .then(retrySuspendedRoot) callbacks and each
-  // one performs Sync work, rerendering the Suspense.
-
-  if ((boundaryFiber.mode & ConcurrentMode) !== NoContext) {
-    if (root === nextRoot && nextRenderExpirationTime === suspendedTime) {
-      // Received a ping at the same priority level at which we're currently
-      // rendering. Restart from the root.
-      nextRoot = null;
+    const rootExpirationTime = root.expirationTime;
+    if (rootExpirationTime !== NoWork) {
+      requestWork(root, rootExpirationTime);
     }
-  }
-
-  scheduleWorkToRoot(boundaryFiber, retryTime);
-  if ((boundaryFiber.mode & ConcurrentMode) === NoContext) {
-    // Outside of concurrent mode, we must schedule an update on the source
-    // fiber, too, since it already committed in an inconsistent state and
-    // therefore does not have any pending work.
-    scheduleWorkToRoot(sourceFiber, retryTime);
-    const sourceTag = sourceFiber.tag;
-    if (sourceTag === ClassComponent && sourceFiber.stateNode !== null) {
-      // When we try rendering again, we should not reuse the current fiber,
-      // since it's known to be in an inconsistent state. Use a force updte to
-      // prevent a bail out.
-      const update = createUpdate(retryTime);
-      update.tag = ForceUpdate;
-      enqueueUpdate(sourceFiber, update);
-    }
-  }
-
-  const rootExpirationTime = root.expirationTime;
-  if (rootExpirationTime !== NoWork) {
-    requestWork(root, rootExpirationTime);
   }
 }
 
@@ -1747,6 +1747,46 @@ function scheduleWorkToRoot(fiber: Fiber, expirationTime): FiberRoot | null {
     }
   }
 
+  if (enableSchedulerTracing) {
+    if (root !== null) {
+      const interactions = __interactionsRef.current;
+      if (interactions.size > 0) {
+        const pendingInteractionMap = root.pendingInteractionMap;
+        const pendingInteractions = pendingInteractionMap.get(expirationTime);
+        if (pendingInteractions != null) {
+          interactions.forEach(interaction => {
+            if (!pendingInteractions.has(interaction)) {
+              // Update the pending async work count for previously unscheduled interaction.
+              interaction.__count++;
+            }
+
+            pendingInteractions.add(interaction);
+          });
+        } else {
+          pendingInteractionMap.set(expirationTime, new Set(interactions));
+
+          // Update the pending async work count for the current interactions.
+          interactions.forEach(interaction => {
+            interaction.__count++;
+          });
+        }
+
+        const subscriber = __subscriberRef.current;
+        if (subscriber !== null) {
+          const threadID = computeThreadID(
+            expirationTime,
+            root.interactionThreadID,
+          );
+          subscriber.onWorkScheduled(interactions, threadID);
+        }
+      }
+    }
+  }
+  return root;
+}
+
+function scheduleWork(fiber: Fiber, expirationTime: ExpirationTime) {
+  const root = scheduleWorkToRoot(fiber, expirationTime);
   if (root === null) {
     if (__DEV__) {
       switch (fiber.tag) {
@@ -1761,49 +1801,6 @@ function scheduleWorkToRoot(fiber: Fiber, expirationTime): FiberRoot | null {
           break;
       }
     }
-    return null;
-  }
-
-  if (enableSchedulerTracing) {
-    const interactions = __interactionsRef.current;
-    if (interactions.size > 0) {
-      const pendingInteractionMap = root.pendingInteractionMap;
-      const pendingInteractions = pendingInteractionMap.get(expirationTime);
-      if (pendingInteractions != null) {
-        interactions.forEach(interaction => {
-          if (!pendingInteractions.has(interaction)) {
-            // Update the pending async work count for previously unscheduled interaction.
-            interaction.__count++;
-          }
-
-          pendingInteractions.add(interaction);
-        });
-      } else {
-        pendingInteractionMap.set(expirationTime, new Set(interactions));
-
-        // Update the pending async work count for the current interactions.
-        interactions.forEach(interaction => {
-          interaction.__count++;
-        });
-      }
-
-      const subscriber = __subscriberRef.current;
-      if (subscriber !== null) {
-        const threadID = computeThreadID(
-          expirationTime,
-          root.interactionThreadID,
-        );
-        subscriber.onWorkScheduled(interactions, threadID);
-      }
-    }
-  }
-
-  return root;
-}
-
-function scheduleWork(fiber: Fiber, expirationTime: ExpirationTime) {
-  const root = scheduleWorkToRoot(fiber, expirationTime);
-  if (root === null) {
     return;
   }
 
@@ -2548,7 +2545,8 @@ export {
   onUncaughtError,
   renderDidSuspend,
   renderDidError,
-  retrySuspendedRoot,
+  pingSuspendedRoot,
+  retryTimedOutBoundary,
   markLegacyErrorBoundaryAsFailed,
   isAlreadyFailedLegacyErrorBoundary,
   scheduleWork,
